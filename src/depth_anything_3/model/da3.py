@@ -30,11 +30,24 @@ from depth_anything_3.utils.alignment import (
     set_sky_regions_to_max_depth,
 )
 from depth_anything_3.utils.geometry import affine_inverse, as_homogeneous, map_pdf_to_opacity
+from depth_anything_3.utils.logger import logger
 from depth_anything_3.utils.ray_utils import get_extrinsic_from_camray
 
 
 def _wrap_cfg(cfg_obj):
     return OmegaConf.create(cfg_obj)
+
+def log_tensor_info(x:torch.Tensor ) ->None:
+    if not isinstance(x, torch.Tensor):
+        logger.warn(f"x: not a torch.Tensor, got {type(x)}")
+        return 
+    shape = tuple(x.shape)
+    dtype = x.dtype
+    device = x.device
+
+    logger.info(f"INFO !!: x shape={shape} dtype={dtype} device={device}")
+
+
 
 
 class DepthAnything3Net(nn.Module):
@@ -128,10 +141,30 @@ class DepthAnything3Net(nn.Module):
                 cam_token = self.cam_enc(extrinsics, intrinsics, x.shape[-2:])
         else:
             cam_token = None
-
+        logger.info("=" * 80)
+        logger.info("INFO !! [DepthAnything3Net] [forward]")
+        log_tensor_info(x)
+        logger.info("=" * 80)
         feats, aux_feats = self.backbone(
             x, cam_token=cam_token, export_feat_layers=export_feat_layers, ref_view_strategy=ref_view_strategy
         )
+        
+        # 打印 backbone 输出的详细信息
+        logger.info("INFO !! [DepthAnything3Net] [forward] 输出特征详细信息:")
+        logger.info(f"  feats 数量: {len(feats)} ,type feat : {type(feats)} ,type feats[0]: {type(feats[0])}")
+        logger.info(f"  aux_feats 数量: {len(aux_feats)} ,type aux_feats: {type(aux_feats)}")
+        
+        # 打印 feats 的详细信息
+        for idx, (feat, camera_token) in enumerate(feats):
+            logger.info(f"  feats[{idx}]:")
+            logger.info(f"    feat shape: {feat.shape}, dtype: {feat.dtype}")
+            logger.info(f"    camera_token shape: {camera_token.shape}, dtype: {camera_token.dtype}")
+        # 打印 aux_feats 的详细信息
+        # for idx, aux_feat in enumerate(aux_feats):
+        #     logger.info(f"  aux_feats[{idx}]:")
+        #     logger.info(f"    shape: {aux_feat.shape}, dtype: {aux_feat.dtype}, device: {aux_feat.device}")
+        #     logger.info(f"    mean: {aux_feat.mean().item():.6f}, std: {aux_feat.std().item():.6f}")
+        #     logger.info(f"    min: {aux_feat.min().item():.6f}, max: {aux_feat.max().item():.6f}")
         # feats = [[item for item in feat] for feat in feats]
         H, W = x.shape[-2], x.shape[-1]
 

@@ -11,7 +11,7 @@ Built on the ideas of `VGGT-Long`, it focuses on memory efficiency and stable on
 
 ### **Updates**
 
-`[09 Nov 2025]` Code of `DA3-Streaming` release.
+`[11 Nov 2025]` Code of `DA3-Streaming` release.
 
 ##  Setup, Installation & Running
 
@@ -21,12 +21,13 @@ Clone the repo using the `--recursive` flag
 
 ```cmd
 git clone --recursive https://github.com/ByteDance-Seed/Depth-Anything-3.git
-cd Depth-Anything-3/DA3-Streaming
+
 ```
 
 If you forgot `--recursive`
 
 ```cmd
+cd <your_dir>/Depth-Anything-3/
 git submodule update --init --recursive .
 ```
 
@@ -120,7 +121,7 @@ We conducted some additional experiments to compare the performance differences 
 | **DA3-Streaming**        |60| **16.83**  | <span style="text-decoration: underline;">10.64</span>          | 5.13 | 78.76 | 35.64 | 5.38 | 3.18 | 3.04 | 2.83 | 2.32 | 26.55 | 8.86 | 13.42   |
 
 
-In `DA3-Streaming`, we restructured the code and accelerated it using GPU technology. Currently, our method achieves a running speed of nearly `10 FPS` without the Keyframe strategy (the test time has excluded Warm-up, model loading and ply result saving). Following results are evaluated on KITTI sequences 00, 05, and 08, totaling 11,373 frames, using an NVIDIA A100 GPU.
+In `DA3-Streaming`, we restructured the code and accelerated it using GPU technology. Currently, our method achieves a running speed of nearly `10 FPS` without the Keyframe strategy (the test time has excluded warm-up, model loading and ply result saving). Following results are evaluated on KITTI sequences 00, 05, and 08, totaling 11,373 frames, using an NVIDIA A100 GPU.
 
 | **Method**         | **Time** | **FPS** |
 |:------------------:|:------------------------:|:------------------------:|

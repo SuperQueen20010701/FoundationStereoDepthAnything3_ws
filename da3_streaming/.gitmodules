@@ -1,4 +1,0 @@
-
-[submodule "loop_utils/salad"]
-	path = loop_utils/salad
-	url = https://github.com/serizba/salad.git

@@ -226,12 +226,17 @@ class InputProcessor:
         process_res_method: str,
     ) -> tuple[torch.Tensor, tuple[int, int], np.ndarray | None, np.ndarray | None]:
         # Load & remember original size
+        logger.info("=" * 80)
+        logger.info(f"[InputProcessor] [process_one] img")
+        
         pil_img = self._load_image(img)
         orig_w, orig_h = pil_img.size
+        logger.info(f"[InputProcessor] [process_one] orig_w: {orig_w}, orig_h: {orig_h} , and after resize image type is {type(pil_img)}")
 
         # Boundary resize
         pil_img = self._resize_image(pil_img, process_res, process_res_method)
         w, h = pil_img.size
+        logger.info(f"After resize the image size is w:{w} and h{h}")
         intrinsic = self._resize_ixt(intrinsic, orig_w, orig_h, w, h)
 
         # Enforce divisibility by PATCH_SIZE
@@ -252,7 +257,7 @@ class InputProcessor:
         img_tensor = self._normalize_image(pil_img)
         _, H, W = img_tensor.shape
         assert (W, H) == (w, h), "Tensor size mismatch with PIL image size after processing."
-
+        logger.info(f"After process_res_method the new image tensor size is H:{H} W:{W}")
         # Return: (img_tensor, (H, W), intrinsic, extrinsic)
         return img_tensor, (H, W), intrinsic, extrinsic
 

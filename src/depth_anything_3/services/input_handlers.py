@@ -89,8 +89,8 @@ class ImagesHandler(InputHandler):
         image_files = []
         for ext in extensions:
             pattern = f"*{ext}"
-            image_files.extend(glob.glob(os.path.join(images_dir, pattern)))
-            image_files.extend(glob.glob(os.path.join(images_dir, pattern.upper())))
+            # Search recursively in subdirectories using ** pattern
+            image_files.extend(glob.glob(os.path.join(images_dir, "**", pattern), recursive=True))
 
         image_files = sorted(list(set(image_files)))  # Remove duplicates and sort
 

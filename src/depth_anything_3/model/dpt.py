@@ -26,6 +26,7 @@ from depth_anything_3.model.utils.head_utils import (
     custom_interpolate,
     position_grid_to_embed,
 )
+from depth_anything_3.utils.logger import logger
 
 
 class DPT(nn.Module):
@@ -41,7 +42,7 @@ class DPT(nn.Module):
 
     def __init__(
         self,
-        dim_in: int,
+        dim_in: int,  # 1024
         *,
         patch_size: int = 14,
         output_dim: int = 1,
@@ -74,7 +75,7 @@ class DPT(nn.Module):
         self.sky_name = sky_name
 
         # Main head: output dimension and confidence switch
-        self.out_dim = output_dim
+        self.out_dim = output_dim  # out depth 
         self.has_conf = output_dim > 1
 
         # Sky head parameters (always 1 channel)
@@ -101,13 +102,13 @@ class DPT(nn.Module):
             [
                 nn.ConvTranspose2d(
                     out_channels[0], out_channels[0], kernel_size=4, stride=4, padding=0
-                ),
+                ),# 1/4(局部)
                 nn.ConvTranspose2d(
                     out_channels[1], out_channels[1], kernel_size=2, stride=2, padding=0
-                ),
-                nn.Identity(),
+                ),#1/2 （看中物体）
+                nn.Identity(), # 1/1
                 nn.Conv2d(out_channels[3], out_channels[3], kernel_size=3, stride=2, padding=1),
-            ]
+            ] # 2 看大物体
         )
 
         # -------------------- scratch: stage adapters + main fusion chain --------------------
@@ -175,14 +176,16 @@ class DPT(nn.Module):
         Returns:
             Dict[str, Tensor]
         """
-        B, S, N, C = feats[0][0].shape
+        B, S, N, C = feats[0][0].shape # ([1, 2, 720, 1024])
+        logger.info(f"INFO !! [DPT] [forward] feats[0][0].shape: {feats[0][0].shape}")
         feats = [feat[0].reshape(B * S, N, C) for feat in feats]
 
         # update image info, used by the GS-DPT head
         extra_kwargs = {}
         if "images" in kwargs:
             extra_kwargs.update({"images": rearrange(kwargs["images"], "B S ... -> (B S) ...")})
-
+        # logger.info(f"INFO !! [DPT] [forward] extra_kwargs: {extra_kwargs}")
+        # logger.info(f"INFO !! [DPT] [forward] chunk_size: {chunk_size}")
         if chunk_size is None or chunk_size >= S:
             out_dict = self._forward_impl(feats, H, W, patch_start_idx, **extra_kwargs)
             out_dict = {k: v.view(B, S, *v.shape[1:]) for k, v in out_dict.items()}
@@ -216,14 +219,19 @@ class DPT(nn.Module):
         resized_feats = []
         for stage_idx, take_idx in enumerate(self.intermediate_layer_idx):
             x = feats[take_idx][:, patch_start_idx:]  # [B*S, N_patch, C]
-            x = self.norm(x)
+            x = self.norm(x) # normalization
+            logger.info(f"INFO !! [DPT] [forward] x.shape: {x.shape}")
             # permute -> contiguous before reshape to keep conv input contiguous
             x = x.permute(0, 2, 1).contiguous().reshape(B, C, ph, pw)  # [B*S, C, ph, pw]
-
+            logger.info(f"INFO !! [DPT] [ _forward_impl] after reshape the x shape is {x.shape}")
             x = self.projects[stage_idx](x)
+            logger.info(f"INFO !! [DPT] [ _forward_impl] after projects the x shape is {x.shape}")
             if self.pos_embed:
                 x = self._add_pos_embed(x, W, H)
+                logger.info(f"INFO !! [DPT] [ _forward_impl] after _add_pos_embed the x shape is {x.shape}")
             x = self.resize_layers[stage_idx](x)  # Align scale
+            logger.info(f"INFO !! [DPT] [ _forward_impl] after resize_layers the x shape is {x.shape}")
+            
             resized_feats.append(x)
 
         # 2) Fusion pyramid (main branch only)

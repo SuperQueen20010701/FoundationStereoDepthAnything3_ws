@@ -41,7 +41,7 @@ from depth_anything_3.utils.pose_align import align_poses_umeyama
 torch.backends.cudnn.benchmark = False
 # logger.info("CUDNN Benchmark Disabled")
 
-SAFETENSORS_NAME = "model.safetensors"
+SAFETENSORS_NAME = ""
 CONFIG_NAME = "config.json"
 
 
@@ -87,6 +87,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         # Build the underlying network
         self.config = load_config(MODEL_REGISTRY[self.model_name])
         self.model = create_object(self.config)
+        # for the type of the model 
         self.model.eval()
 
         # Initialize processors
@@ -124,10 +125,24 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         """
         # Determine optimal autocast dtype
         autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        # print model info 
+        
         with torch.no_grad():
             with torch.autocast(device_type=image.device.type, dtype=autocast_dtype):
+                print("="*80)
+                logger.info(f"model type is ",type(self.model))
+                for name, module in self.model.named_children():
+                    print(f"  - {name}: {type(module).__name__}")
+                print("="*80)
+
                 return self.model(
-                    image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy
+                    image, 
+                    extrinsics, 
+                    intrinsics,
+                    export_feat_layers, 
+                    infer_gs, 
+                    use_ray_pose, 
+                    ref_view_strategy
                 )
 
     def inference(
@@ -197,7 +212,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             image, extrinsics, intrinsics, process_res, process_res_method
         )
 
-        # Prepare tensors for model
+        # Prepare tensors for model(move to device(cuda))
         imgs, ex_t, in_t = self._prepare_model_inputs(imgs_cpu, extrinsics, intrinsics)
 
         # Normalize extrinsics
@@ -293,7 +308,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         logger.info(
             "Processed Images Done taking",
             end_time - start_time,
-            "seconds. Shape: ",
+            "seconds.Image Shape: ",
             imgs_cpu.shape,
         )
         return imgs_cpu, extrinsics, intrinsics
@@ -323,18 +338,18 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         )
 
         return imgs, ex_t, in_t
-
+    # 实现估计外参的尺度归一化 
     def _normalize_extrinsics(self, ex_t: torch.Tensor | None) -> torch.Tensor | None:
         """Normalize extrinsics"""
         if ex_t is None:
             return None
-        transform = affine_inverse(ex_t[:, :1])
-        ex_t_norm = ex_t @ transform
-        c2ws = affine_inverse(ex_t_norm)
+        transform = affine_inverse(ex_t[:, :1]) # 仿射矩阵的逆变换
+        ex_t_norm = ex_t @ transform # project to first camera
+        c2ws = affine_inverse(ex_t_norm) # camera0 to camera1
         translations = c2ws[..., :3, 3]
-        dists = translations.norm(dim=-1)
+        dists = translations.norm(dim=-1) # translation normalization 
         median_dist = torch.median(dists)
-        median_dist = torch.clamp(median_dist, min=1e-1)
+        median_dist = torch.clamp(median_dist, min=1e-1) # avoid zero
         ex_t_norm[..., :3, 3] = ex_t_norm[..., :3, 3] / median_dist
         return ex_t_norm
 
@@ -386,6 +401,10 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             torch.cuda.synchronize(device)
         end_time = time.time()
         logger.info(f"Model Forward Pass Done. Time: {end_time - start_time} seconds")
+        
+        # Print raw_output information for debugging
+        self._print_raw_output_info(output)
+        
         return output
 
     def _convert_to_prediction(self, raw_output: dict[str, torch.Tensor]) -> Prediction:
@@ -419,6 +438,12 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         export(prediction, export_format, export_dir, **kwargs)
         end_time = time.time()
         logger.info(f"Export Results Done. Time: {end_time - start_time} seconds")
+
+    def _print_raw_output_info(self, raw_output) -> None:
+        logger.info(f"Number of keys in raw_output: {len(raw_output)}")
+        logger.info(f"Keys: {list(raw_output.keys())}")
+        logger.info(f"Type of raw_output: {type(raw_output).__name__}")
+    
 
     def _get_model_device(self) -> torch.device:
         """

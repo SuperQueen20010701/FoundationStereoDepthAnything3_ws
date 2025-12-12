@@ -158,7 +158,7 @@ class DinoVisionTransformer(nn.Module):
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim
         )
         num_patches = self.patch_embed.num_patches
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) # 1024 embed dim
         if self.alt_start != -1:
             self.camera_token = nn.Parameter(torch.randn(1, 2, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
@@ -299,19 +299,21 @@ class DinoVisionTransformer(nn.Module):
 
     def _get_intermediate_layers_not_chunked(self, x, n=1, export_feat_layers=[], **kwargs):
         B, S, _, H, W = x.shape
-        x = self.prepare_tokens_with_masks(x)
+        x = self.prepare_tokens_with_masks(x) # 将视图转换成token
+        # block是用来实现depthanything3的注意力机制
         output, total_block_len, aux_output = [], len(self.blocks), []
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         pos, pos_nodiff = self._prepare_rope(B, S, H, W, x.device)
-
+        # 准备位置编码
         for i, blk in enumerate(self.blocks):
             if i < self.rope_start or self.rope is None:
                 g_pos, l_pos = None, None
             else:
                 g_pos = pos_nodiff
                 l_pos = pos
-
-            if self.alt_start != -1 and (i == self.alt_start - 1) and x.shape[1] >= THRESH_FOR_REF_SELECTION and kwargs.get("cam_token", None) is None:
+            # 参考视图的选择
+            if self.alt_start != -1 and (i == self.alt_start - 1) and x.shape[1] >= THRESH_FOR_REF_SELECTION \
+                 and kwargs.get("cam_token", None) is None:
                 # Select reference view using configured strategy
                 strategy = kwargs.get("ref_view_strategy", "saddle_balanced")
                 logger.info(f"Selecting reference view using strategy: {strategy}")
@@ -319,21 +321,22 @@ class DinoVisionTransformer(nn.Module):
                 # Reorder views to place reference view first
                 x = reorder_by_reference(x, b_idx)
                 local_x = reorder_by_reference(local_x, b_idx)
-
+            #替换参考视图的token
             if self.alt_start != -1 and i == self.alt_start:
                 if kwargs.get("cam_token", None) is not None:
                     logger.info("Using camera conditions provided by the user")
                     cam_token = kwargs.get("cam_token")
-                else:
+                else:   
                     ref_token = self.camera_token[:, :1].expand(B, -1, -1)
                     src_token = self.camera_token[:, 1:].expand(B, S - 1, -1)
                     cam_token = torch.cat([ref_token, src_token], dim=1)
                 x[:, :, 0] = cam_token
-
+            # 全局注意力
             if self.alt_start != -1 and i >= self.alt_start and i % 2 == 1:
                 x = self.process_attention(
                     x, blk, "global", pos=g_pos, attn_mask=kwargs.get("attn_mask", None)
                 )
+            # 局部注意力
             else:
                 x = self.process_attention(x, blk, "local", pos=l_pos)
                 local_x = x
@@ -343,7 +346,7 @@ class DinoVisionTransformer(nn.Module):
                 # Restore original view order if reordering was applied
                 if x.shape[1] >= THRESH_FOR_REF_SELECTION and self.alt_start != -1 and 'b_idx' in locals():
                     out_x = restore_original_order(out_x, b_idx)
-                output.append((out_x[:, :, 0], out_x))
+                output.append((out_x[:, :, 0], out_x))  # cls token  and all token
             if i in export_feat_layers:
                 aux_output.append(x)
         return output, aux_output
@@ -379,15 +382,34 @@ class DinoVisionTransformer(nn.Module):
         outputs, aux_outputs = self._get_intermediate_layers_not_chunked(
             x, n, export_feat_layers=export_feat_layers, **kwargs
         )
-        camera_tokens = [out[0] for out in outputs]
-        if outputs[0][1].shape[-1] == self.embed_dim:
-            outputs = [self.norm(out[1]) for out in outputs]
-        elif outputs[0][1].shape[-1] == (self.embed_dim * 2):
+        
+        # logger.info(f"INFO !! [get_intermediate_layers] outputs 数量: {len(outputs)}")
+        # for idx, out in enumerate(outputs):
+        #     camera_token, full_output = out[0], out[1]
+        #     logger.info(
+        #         f"  outputs[{idx}]: "
+        #         f"camera_token shape={camera_token.shape}, dtype={camera_token.dtype}")
+        #     logger.info(
+        #         f"  outputs[{idx}]: "
+        #         f"full_output shape={full_output.shape}, dtype={full_output.dtype}")
+        
+        # # 打印 aux_outputs 信息
+        # logger.info(f"INFO !! [get_intermediate_layers] aux_outputs 数量: {len(aux_outputs)}")
+        # for idx, aux_out in enumerate(aux_outputs):
+        #     logger.info(
+        #         f"  aux_outputs[{idx}]: "
+        #         f"shape={aux_out.shape}, dtype={aux_out.dtype}")
+        # logger.info(f'outputs length: {len(outputs)} , outputs shape: {outputs[0][1].shape}')
+        camera_tokens = [out[0] for out in outputs] # camera token
+        
+        if outputs[0][1].shape[-1] == self.embed_dim: # cat_token=False
+            outputs = [self.norm(out[1]) for out in outputs]  # feature执行归一化
+        elif outputs[0][1].shape[-1] == (self.embed_dim * 2): # cat_token=True 局部+全局拼接
             outputs = [
                 torch.cat(
                     [out[1][..., : self.embed_dim], self.norm(out[1][..., self.embed_dim :])],
                     dim=-1,
-                )
+                )  # 局部特征不归一化 + 全局特征归一化
                 for out in outputs
             ]
         else:
@@ -395,6 +417,28 @@ class DinoVisionTransformer(nn.Module):
         aux_outputs = [self.norm(out) for out in aux_outputs]
         outputs = [out[..., 1 + self.num_register_tokens :, :] for out in outputs]
         aux_outputs = [out[..., 1 + self.num_register_tokens :, :] for out in aux_outputs]
+        
+        # 打印最终输出信息
+        logger.info(f"INFO !! [get_intermediate_layers] 最终输出信息:")
+        logger.info(f"  outputs 数量: {len(outputs)} , outputs shape: {outputs[0].shape}") # 4 [1, 1, 720, 1024]
+        logger.info(f'camera_tokens length: {len(camera_tokens)} , camera_tokens shape: {camera_tokens[0].shape}') # 
+        for idx, (output, camera_token) in enumerate(zip(outputs, camera_tokens)):
+            logger.info(
+                f"  outputs[{idx}]: "
+                f"output shape={output.shape}, dtype={output.dtype}"
+            )
+            logger.info(
+                f"  outputs[{idx}]: "
+                f"camera_token shape={camera_token.shape}, dtype={camera_token.dtype}"
+            )
+        
+        logger.info(f"  aux_outputs 数量: {len(aux_outputs)}")
+        for idx, aux_out in enumerate(aux_outputs):
+            logger.info(
+                f"  aux_outputs[{idx}]: "
+                f"shape={aux_out.shape}, dtype={aux_out.dtype}, "
+                f"mean={aux_out.mean().item():.6f}, std={aux_out.std().item():.6f}"
+            )
         return tuple(zip(outputs, camera_tokens)), aux_outputs
 
 
