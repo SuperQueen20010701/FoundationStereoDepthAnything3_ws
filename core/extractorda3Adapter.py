@@ -17,6 +17,8 @@ from core.submodule import LayerNorm2d, BasicConv, Conv2x_IN
 from Utils import get_resize_keep_aspect_ratio, freeze_model
 import timm
 
+from core.da3_dense_feature_backbone import DA3DenseFeatureBackbone
+
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_planes, planes, norm_fn='group', stride=1):
@@ -79,6 +81,8 @@ class ResidualBlock(nn.Module):
             x = self.downsample(x)
 
         return self.relu(x+y)
+
+
 
 class MultiBasicEncoder(nn.Module):
     def __init__(self, output_dim=[128], norm_fn='batch', dropout=0.0, downsample=3):
@@ -186,13 +190,18 @@ class MultiBasicEncoder(nn.Module):
 
         return (outputs04, outputs08, outputs16, v) if dual_inp else (outputs04, outputs08, outputs16)
 
+
+
 class ContextNetDino(MultiBasicEncoder):
     def __init__(self, args, output_dim=[128], norm_fn='batch', downsample=3):
         nn.Module.__init__(self)
         self.args = args
         self.patch_size = 14
         self.image_size = 518
-        self.vit_feat_dim = 384
+        # Channel dimension of the external dense feature map `vit_feat` that will be concatenated.
+        # - Legacy path (DepthAnything V2): depends on vit_size
+        # - DA3 path (DA3DenseFeatureBackbone): fixed 128
+        self.use_da3 = bool(getattr(self.args, "use_da3", False))
         code_dir = os.path.dirname(os.path.realpath(__file__))
 
         self.out_dims = output_dim
@@ -227,8 +236,12 @@ class ContextNetDino(MultiBasicEncoder):
           nn.Conv2d(128, 128, kernel_size=4, stride=4, padding=0),
           nn.BatchNorm2d(128),
         )
-        vit_dim = DepthAnythingFeature.model_configs[self.args.vit_size]['features']//2
-        self.conv2 = BasicConv(128+vit_dim, 128, kernel_size=3, padding=1)
+        if self.use_da3:
+            vit_dim = 128
+        else:
+            vit_dim = DepthAnythingFeature.model_configs[self.args.vit_size]['features']//2
+        self.vit_feat_dim = vit_dim
+        self.conv2 = BasicConv(128 + vit_dim, 128, kernel_size=3, padding=1)
         self.norm = nn.BatchNorm2d(256)
 
         output_list = []
@@ -279,6 +292,7 @@ class ContextNetDino(MultiBasicEncoder):
 
         return (outputs04, outputs08, outputs16)
 
+
 class DepthAnythingFeature(nn.Module):
     model_configs = {
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
@@ -315,18 +329,40 @@ class DepthAnythingFeature(nn.Module):
 
         return {'out':out, 'path_1':path_1, 'path_2':path_2, 'path_3':path_3, 'path_4':path_4, 'features':features, 'disp':disp}  # path_1 is 1/2; path_2 is 1/4
 
+
 class Feature(nn.Module):
     def __init__(self, args):
         super(Feature, self).__init__()
         self.args = args
-        model = timm.create_model('edgenext_small', pretrained=True, features_only=False)
+        # NOTE: `timm` pretrained weights may require network on first use.
+        # Keep default behavior (pretrained=True), but allow disabling via config for offline / CI checks.
+        edgenext_pretrained = bool(getattr(self.args, "edgenext_pretrained", True))
+        model = timm.create_model('edgenext_small', pretrained=edgenext_pretrained, features_only=False)
         self.stem = model.stem
         self.stages = model.stages
         chans = [48, 96, 160, 304]
         self.chans = chans
-        self.dino = DepthAnythingFeature(encoder=self.args.vit_size)
-        self.dino = freeze_model(self.dino)
-        vit_feat_dim = DepthAnythingFeature.model_configs[self.args.vit_size]['features']//2
+        # Dense "vit-like" feature map used at 1/4 resolution.
+        # Default (legacy): DepthAnything V2 features.
+        # Optional: DA3 dense features via adapter (tokens -> DPT neck -> dense map).
+        self.use_da3 = bool(getattr(self.args, "use_da3", False))
+        if self.use_da3:
+            model_dir = getattr(self.args, "da3_model_dir", None)
+            if model_dir is None:
+                raise ValueError("args.use_da3=True but args.da3_model_dir is not set")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.dino = DA3DenseFeatureBackbone(
+                model_dir=model_dir,
+                device=device,
+                input_layout="stacked_lr",  # FoundationStereo uses torch.cat([left, right], dim=0)
+                allow_pad_to_divisible=False,
+            )
+            self.dino = freeze_model(self.dino)
+            vit_feat_dim = 128
+        else:
+            self.dino = DepthAnythingFeature(encoder=self.args.vit_size)
+            self.dino = freeze_model(self.dino)
+            vit_feat_dim = DepthAnythingFeature.model_configs[self.args.vit_size]['features']//2
 
         self.deconv32_16 = Conv2x_IN(chans[3], chans[2], deconv=True, concat=True)
         self.deconv16_8 = Conv2x_IN(chans[2]*2, chans[1], deconv=True, concat=True)
@@ -348,7 +384,7 @@ class Feature(nn.Module):
         self.dino = self.dino.eval()
         with torch.no_grad():
           output = self.dino(x_in_)
-        vit_feat = output['out']
+        vit_feat = output['out']  # [2B, vit_feat_dim, H_resize', W_resize']
         vit_feat = F.interpolate(vit_feat, size=(H//4,W//4), mode='bilinear', align_corners=True)
         x = self.stem(x)
         x4 = self.stages[0](x)

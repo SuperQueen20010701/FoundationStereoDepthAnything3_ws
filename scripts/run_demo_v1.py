@@ -40,6 +40,9 @@ if __name__=="__main__":
   parser.add_argument('--denoise_cloud', type=int, default=1, help='whether to denoise the point cloud')
   parser.add_argument('--denoise_nb_points', type=int, default=30, help='number of points to consider for radius outlier removal')
   parser.add_argument('--denoise_radius', type=float, default=0.03, help='radius to use for outlier removal')
+  # Optional: swap the legacy DepthAnythingV2 dense feature with Depth-Anything-3 dense feature (via adapter)
+  parser.add_argument('--use_da3', action='store_true', help='Use Depth-Anything-3 as dense feature backbone')
+  parser.add_argument('--da3_model_dir', type=str, default=None, help='Path to DA3 pretrained model directory (required if --use_da3)')
   args = parser.parse_args()
 
   set_logging_format()
