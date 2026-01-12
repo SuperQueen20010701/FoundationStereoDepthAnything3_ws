@@ -23,10 +23,10 @@ from core.submodule import (
     ResnetBasicBlock3D, build_gwc_volume, build_concat_volume, disparity_regression,
     context_upsample
 )
+from core.extractor_da3 import Feature_da3
 from core.utils.utils import InputPadder
 # from Utils import *
 import time,huggingface_hub
-
 
 try:
     autocast = torch.cuda.amp.autocast
@@ -145,8 +145,9 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         self.cam = ChannelAttentionEnhancement(self.args.hidden_dims[0])
 
         self.context_zqr_convs = nn.ModuleList([nn.Conv2d(context_dims[i], args.hidden_dims[i]*3, kernel_size=3, padding=3//2) for i in range(self.args.n_gru_layers)])
-
-        self.feature = Feature(args)
+        
+        self.feature = Feature_da3(args) if args.use_da3 else Feature(args)  # select whether to using the backbone 
+        self.patch_size = self.feature.patch_size
         self.proj_cmb = nn.Conv2d(self.feature.d_out[0], 12, kernel_size=1, padding=0)
 
         self.stem_2 = nn.Sequential(
@@ -185,10 +186,9 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         dx = torch.linspace(-r, r, 2*r+1, requires_grad=False).reshape(1, 1, 2*r+1, 1)
         self.dx = dx
 
-
     def upsample_disp(self, disp, mask_feat_4, stem_2x):
 
-        with autocast(enabled=self.args.mixed_precision):
+        with torch.amp.autocast('cuda', enabled=self.args.mixed_precision):
             xspx = self.spx_2_gru(mask_feat_4, stem_2x)   # 1/2 resolution
             spx_pred = self.spx_gru(xspx)
             spx_pred = F.softmax(spx_pred, 1)
@@ -197,13 +197,25 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         return up_disp.float()
 
 
-    def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False, low_memory=False, init_disp=None):
+    def forward(
+        self,
+        image1,
+        image2,
+        iters=12,
+        flow_init=None,
+        test_mode=False,
+        low_memory=False,
+        init_disp=None,
+        *,
+        already_normalized: bool = False,
+    ):
         """ Estimate disparity between pair of frames """
         B = len(image1)
         low_memory = low_memory or (self.args.get('low_memory', False))
-        image1 = normalize_image(image1)
-        image2 = normalize_image(image2)
-        with autocast(enabled=self.args.mixed_precision):
+        if not already_normalized:
+            image1 = normalize_image(image1)
+            image2 = normalize_image(image2)
+        with torch.amp.autocast('cuda', enabled=self.args.mixed_precision):
             out, vit_feat = self.feature(torch.cat([image1, image2], dim=0))
             vit_feat = vit_feat[:B]
             features_left = [o[:B] for o in out]
@@ -242,7 +254,7 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         for itr in range(iters):
             disp = disp.detach()
             geo_feat = geo_fn(disp, coords, low_memory=low_memory)
-            with autocast(enabled=self.args.mixed_precision):
+            with torch.amp.autocast('cuda', enabled=self.args.mixed_precision):
               net_list, mask_feat_4, delta_disp = self.update_block(net_list, inp_list, geo_feat, disp, att)
 
             disp = disp + delta_disp.float()
@@ -260,13 +272,30 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         return init_disp, disp_preds
 
 
-    def run_hierachical(self, image1, image2, iters=12, test_mode=False, low_memory=False, small_ratio=0.5):
+    def run_hierachical(
+        self,
+        image1,
+        image2,
+        iters=12,
+        test_mode=False,
+        low_memory=False,
+        small_ratio=0.5,
+        *,
+        already_normalized: bool = False,
+    ):
       B,_,H,W = image1.shape
       img1_small = F.interpolate(image1, scale_factor=small_ratio, align_corners=False, mode='bilinear')
       img2_small = F.interpolate(image2, scale_factor=small_ratio, align_corners=False, mode='bilinear')
       padder = InputPadder(img1_small.shape[-2:], divis_by=32, force_square=False)
       img1_small, img2_small = padder.pad(img1_small, img2_small)
-      disp_small = self.forward(img1_small, img2_small, test_mode=True, iters=iters, low_memory=low_memory)
+      disp_small = self.forward(
+          img1_small,
+          img2_small,
+          test_mode=True,
+          iters=iters,
+          low_memory=low_memory,
+          already_normalized=already_normalized,
+      )
       disp_small = padder.unpad(disp_small.float())
       disp_small_up = F.interpolate(disp_small, size=(H,W), mode='bilinear', align_corners=True) * 1/small_ratio
       disp_small_up = disp_small_up.clip(0, None)
@@ -275,7 +304,61 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       image1, image2, disp_small_up = padder.pad(image1, image2, disp_small_up)
       disp_small_up += padder._pad[0]
       init_disp = F.interpolate(disp_small_up, scale_factor=0.25, mode='bilinear', align_corners=True) * 0.25   # Init disp will be 1/4
-      disp = self.forward(image1, image2, iters=iters, test_mode=test_mode, low_memory=low_memory, init_disp=init_disp)
+      disp = self.forward(
+          image1,
+          image2,
+          iters=iters,
+          test_mode=test_mode,
+          low_memory=low_memory,
+          init_disp=init_disp,
+          already_normalized=already_normalized,
+      )
       disp = padder.unpad(disp.float())
       return disp
 
+    def forward_da3_inputs(
+        self,
+        imgs: torch.Tensor,
+        ex_t_norm: torch.Tensor | None = None,
+        in_t: torch.Tensor | None = None,
+        *,
+        iters: int = 12,
+        test_mode: bool = False,
+        low_memory: bool = False,
+        init_disp: torch.Tensor | None = None,
+        hiera: bool = False,
+        small_ratio: float = 0.5,
+    ):
+        """
+        DA3-style entrypoint for convenience when using `da3_input_processor.prepare_model_inputs`.
+
+        Args:
+            imgs: [B,2,3,H,W] image tensor (ImageNet normalized by DA3 InputProcessor).
+            ex_t_norm / in_t: accepted for API compatibility (currently unused by FoundationStereo).
+        """
+        if ex_t_norm is not None or in_t is not None:
+            logging.warning("FoundationStereo.forward_da3_inputs: ex_t_norm/in_t are currently unused and will be ignored.")
+
+        if imgs.ndim != 5 or imgs.shape[1] != 2 or imgs.shape[2] != 3:
+            raise ValueError(f"Expected imgs as [B,2,3,H,W], got {tuple(imgs.shape)}")
+        image1 = imgs[:, 0]
+        image2 = imgs[:, 1]
+        if hiera:
+            return self.run_hierachical(
+                image1,
+                image2,
+                iters=iters,
+                test_mode=test_mode,
+                low_memory=low_memory,
+                small_ratio=small_ratio,
+                already_normalized=True,
+            )
+        return self.forward(
+            image1,
+            image2,
+            iters=iters,
+            test_mode=test_mode,
+            low_memory=low_memory,
+            init_disp=init_disp,
+            already_normalized=True,
+        )

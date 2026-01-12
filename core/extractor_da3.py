@@ -7,7 +7,7 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 
-import torch,logging,os,sys,urllib,warnings
+import torch, logging, os, sys, urllib, warnings
 import torch.nn as nn
 import torch.nn.functional as F
 code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -16,9 +16,10 @@ import numpy as np
 from core.submodule import LayerNorm2d, BasicConv, Conv2x_IN
 from Utils import get_resize_keep_aspect_ratio, freeze_model
 import timm
-
-from core.da3_dense_feature_backbone import DA3DenseFeatureBackbone
-
+from typing import List, Tuple, Sequence
+from core.stereo_feature import FeatureAdapter
+from depth_anything_3.utils.logger import logger
+import math
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_planes, planes, norm_fn='group', stride=1):
@@ -81,8 +82,6 @@ class ResidualBlock(nn.Module):
             x = self.downsample(x)
 
         return self.relu(x+y)
-
-
 
 class MultiBasicEncoder(nn.Module):
     def __init__(self, output_dim=[128], norm_fn='batch', dropout=0.0, downsample=3):
@@ -190,17 +189,13 @@ class MultiBasicEncoder(nn.Module):
 
         return (outputs04, outputs08, outputs16, v) if dual_inp else (outputs04, outputs08, outputs16)
 
-
-
 class ContextNetDino(MultiBasicEncoder):
     def __init__(self, args, output_dim=[128], norm_fn='batch', downsample=3):
         nn.Module.__init__(self)
         self.args = args
         self.patch_size = 14
         self.image_size = 518
-        # Channel dimension of the external dense feature map `vit_feat` that will be concatenated.
-        # - Legacy path (DepthAnything V2): depends on vit_size
-        # - DA3 path (DA3DenseFeatureBackbone): fixed 128
+
         self.use_da3 = bool(getattr(self.args, "use_da3", False))
         code_dir = os.path.dirname(os.path.realpath(__file__))
 
@@ -292,7 +287,6 @@ class ContextNetDino(MultiBasicEncoder):
 
         return (outputs04, outputs08, outputs16)
 
-
 class DepthAnythingFeature(nn.Module):
     model_configs = {
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
@@ -329,41 +323,39 @@ class DepthAnythingFeature(nn.Module):
 
         return {'out':out, 'path_1':path_1, 'path_2':path_2, 'path_3':path_3, 'path_4':path_4, 'features':features, 'disp':disp}  # path_1 is 1/2; path_2 is 1/4
 
-
-class Feature(nn.Module):
+class Feature_da3(nn.Module):
     def __init__(self, args):
-        super(Feature, self).__init__()
+        super(Feature_da3, self).__init__()
         self.args = args
-        # NOTE: `timm` pretrained weights may require network on first use.
-        # Keep default behavior (pretrained=True), but allow disabling via config for offline / CI checks.
+        # foundationstereo pretrained model 
         edgenext_pretrained = bool(getattr(self.args, "edgenext_pretrained", True))
         model = timm.create_model('edgenext_small', pretrained=edgenext_pretrained, features_only=False)
         self.stem = model.stem
         self.stages = model.stages
         chans = [48, 96, 160, 304]
         self.chans = chans
-        # Dense "vit-like" feature map used at 1/4 resolution.
-        # Default (legacy): DepthAnything V2 features.
-        # Optional: DA3 dense features via adapter (tokens -> DPT neck -> dense map).
-        self.use_da3 = bool(getattr(self.args, "use_da3", False))
-        if self.use_da3:
-            model_dir = getattr(self.args, "da3_model_dir", None)
-            if model_dir is None:
-                raise ValueError("args.use_da3=True but args.da3_model_dir is not set")
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.dino = DA3DenseFeatureBackbone(
-                model_dir=model_dir,
-                device=device,
-                input_layout="stacked_lr",  # FoundationStereo uses torch.cat([left, right], dim=0)
-                allow_pad_to_divisible=False,
-            )
-            self.dino = freeze_model(self.dino)
-            vit_feat_dim = 128
-        else:
-            self.dino = DepthAnythingFeature(encoder=self.args.vit_size)
-            self.dino = freeze_model(self.dino)
-            vit_feat_dim = DepthAnythingFeature.model_configs[self.args.vit_size]['features']//2
-
+        if not bool(getattr(self.args, "use_da3", False)):
+            raise ValueError("Feature_da3 is selected but args.use_da3 is False. Use core.extractor.Feature instead.")
+        model_dir = getattr(self.args, "da3_model_dir", "") or ""
+        if not model_dir:
+            raise ValueError("args.use_da3=True but args.da3_model_dir is empty")
+        gpu = int(getattr(self.args, "gpu", 0))
+        ref_view_strategy = getattr(self.args, "ref_view_strategy", "saddle_balanced")
+        self.feature_backbone = FeatureAdapter(
+            da3_model_dir=model_dir,
+            gpu=gpu,
+            # FoundationStereo stacks batches as [L_batch; R_batch]
+            input_layout="image_stacked",
+            ref_view_strategy=ref_view_strategy,
+            process_res=int(getattr(self.args, "process_res", 504)),
+            process_res_method=str(getattr(self.args, "process_res_method", "upper_bound_resize")),
+            use_autocast=bool(getattr(self.args, "mixed_precision", False)),
+            # Allow internal padding to satisfy DA3 patch constraints (e.g., hiera mode pads by 32).
+            allow_pad_to_divisible=bool(getattr(self.args, "da3_allow_pad_to_divisible", True)),
+            trainable=bool(getattr(self.args, "da3_trainable", False)),
+        )
+        self.da3_trainable = bool(getattr(self.args, "da3_trainable", False))
+        vit_feat_dim = 128
         self.deconv32_16 = Conv2x_IN(chans[3], chans[2], deconv=True, concat=True)
         self.deconv16_8 = Conv2x_IN(chans[2]*2, chans[1], deconv=True, concat=True)
         self.deconv8_4 = Conv2x_IN(chans[1]*2, chans[0], deconv=True, concat=True)
@@ -373,21 +365,65 @@ class Feature(nn.Module):
           ResidualBlock(chans[0]*2+vit_feat_dim, chans[0]*2+vit_feat_dim, norm_fn='instance'),
         )
 
-        self.patch_size = 14
+        self.patch_size = int(getattr(self.feature_backbone, "patch_size", 14))
+        self.required_lcm = int(math.lcm(16, int(self.patch_size)))
         self.d_out = [chans[0]*2+vit_feat_dim, chans[1]*2, chans[2]*2, chans[3]]
+    
+    @staticmethod
+    def _pad_to_lcm(x: torch.Tensor, lcm_hw: int) -> tuple[torch.Tensor, int, int]:
+        """Pad on (H,W) to make divisible by lcm_hw. Returns (x_padded, pad_h, pad_w)."""
+        H, W = x.shape[-2], x.shape[-1]
+        pad_h = (lcm_hw - (H % lcm_hw)) % lcm_hw
+        pad_w = (lcm_hw - (W % lcm_hw)) % lcm_hw
+        if pad_h == 0 and pad_w == 0:
+            return x, 0, 0
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+        return x, pad_h, pad_w
+    
+    @staticmethod
+    def _crop_hw(x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        return x[..., :H, :W]
+    
+    def forward(self, x: torch.Tensor):
+        logger.info(f"[Feature_da3] Input x shape: {tuple(x.shape)}")
+        if x.ndim == 4:
+            if x.shape[1] != 3:
+                raise ValueError(f"Expected x as [2B,3,H,W], got {tuple(x.shape)}")
+            if (x.shape[0] % 2) != 0:
+                raise ValueError(f"Expected stacked batch with even batch size (2B), got {x.shape[0]}")
+            B = x.shape[0] // 2 # for batch
+            H, W = x.shape[-2], x.shape[-1]
+            x_pair = torch.stack([x[:B], x[B:]], dim=1)  # [B,2,3,H,W] dim 4 -> dim 5
+            x_stacked = x
+        elif x.ndim == 5:
+            if x.shape[1] != 2 or x.shape[2] != 3:
+                raise ValueError(f"Expected x as [B,2,3,H,W], got {tuple(x.shape)}")
+            B = x.shape[0]
+            H, W = x.shape[-2], x.shape[-1]
+            x_pair = x
+            # Always use FoundationStereo convention: stacked [L_batch; R_batch]
+            x_stacked = torch.cat([x_pair[:, 0], x_pair[:, 1]], dim=0) # dim 5 -> dim 4
+        else:
+            raise ValueError(f"Unsupported x shape {tuple(x.shape)}")
+        x_pair_pad, pad_h, pad_w = self._pad_to_lcm(x_pair, self.required_lcm)
+        if pad_h or pad_w:
+            x_stacked_pad = torch.cat([x_pair_pad[:, 0], x_pair_pad[:, 1]], dim=0)
+        else:
+            x_stacked_pad = x_stacked
+        logger.info(f"[Feature_da3] Padded x_pair shape: {tuple(x_pair_pad.shape)}")
+        if self.da3_trainable:
+            output = self.feature_backbone(x_pair_pad)
+        else:
+            with torch.no_grad():
+                output = self.feature_backbone(x_pair_pad)
+        vit_feat_full = output["out"]  # [2B, 128, H_pad, W_pad]
+        if pad_h or pad_w:
+            vit_feat_full = self._crop_hw(vit_feat_full, H, W)
 
-    def forward(self, x):
-        B,C,H,W = x.shape
-        divider = np.lcm(self.patch_size, 16)
-        H_resize, W_resize = get_resize_keep_aspect_ratio(H,W, divider=divider, max_H=1344, max_W=1344)
-        x_in_ = F.interpolate(x, size=(H_resize, W_resize), mode='bicubic', align_corners=False)
-        self.dino = self.dino.eval()
-        with torch.no_grad():
-          output = self.dino(x_in_)
-        vit_feat = output['out']  # [2B, vit_feat_dim, H_resize', W_resize']
-        vit_feat = F.interpolate(vit_feat, size=(H//4,W//4), mode='bilinear', align_corners=True)
-        x = self.stem(x)
-        x4 = self.stages[0](x)
+        with torch.amp.autocast("cuda", enabled=False):
+            self.stem.float()
+            x0 = self.stem(x_stacked_pad.float())
+        x4 = self.stages[0](x0)
         x8 = self.stages[1](x4)
         x16 = self.stages[2](x8)
         x32 = self.stages[3](x16)
@@ -395,8 +431,23 @@ class Feature(nn.Module):
         x16 = self.deconv32_16(x32, x16)
         x8 = self.deconv16_8(x16, x8)
         x4 = self.deconv8_4(x8, x4)
-        x4 = torch.cat([x4, vit_feat], dim=1)
+
+        vit_feat_4 = F.interpolate(vit_feat_full, size=x4.shape[-2:], mode='bilinear', align_corners=True)
+        x4 = torch.cat([x4, vit_feat_4], dim=1)
         x4 = self.conv4(x4)
-        return [x4, x8, x16, x32], vit_feat
+
+        # Crop multi-scale outputs back to the original spatial sizes (for compatibility with stem_2, etc.)
+        if pad_h or pad_w:
+            h4, w4 = H // 4, W // 4
+            h8, w8 = H // 8, W // 8
+            h16, w16 = H // 16, W // 16
+            h32, w32 = H // 32, W // 32
+            x4 = self._crop_hw(x4, h4, w4)
+            x8 = self._crop_hw(x8, h8, w8)
+            x16 = self._crop_hw(x16, h16, w16)
+            x32 = self._crop_hw(x32, h32, w32)
+            vit_feat_4 = self._crop_hw(vit_feat_4, h4, w4)
+
+        return [x4, x8, x16, x32], vit_feat_4
 
 
